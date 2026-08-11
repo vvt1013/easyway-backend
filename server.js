@@ -32,6 +32,21 @@ const writeUsers = (data) => fs.writeFileSync(USERS_FILE, JSON.stringify(data, n
 const generateTracking = () =>
   'TRK' + Math.floor(100000 + Math.random() * 900000);
 
+const getEventDate = (event) => new Date(event.timestamp || event.date || 0).getTime();
+
+const getTrackingHistory = (shipment) => {
+  const history = Array.isArray(shipment.trackingHistory)
+    ? shipment.trackingHistory
+    : [{
+        status: shipment.status,
+        location: shipment.location,
+        timestamp: shipment.date,
+        message: shipment.description || shipment.message
+      }];
+
+  return history.sort((first, second) => getEventDate(first) - getEventDate(second));
+};
+
 // ================= USER SYSTEM =================
 
 // SIGNUP
@@ -72,6 +87,7 @@ app.post('/login', (req, res) => {
 // CREATE
 app.post('/create-shipment', (req, res) => {
   const data = readData();
+  const createdAt = new Date().toISOString();
 
   const shipment = {
     trackingNumber: generateTracking(),
@@ -81,7 +97,13 @@ app.post('/create-shipment', (req, res) => {
     destination: req.body.destination,
     status: "Processing",
     location: "Warehouse",
-    date: new Date().toLocaleString()
+    date: createdAt,
+    trackingHistory: [{
+      status: "Shipment created",
+      location: "Warehouse",
+      timestamp: createdAt,
+      message: "Item received"
+    }]
   };
 
   data.push(shipment);
@@ -96,24 +118,48 @@ app.get('/shipments', (req, res) => {
 });
 
 // UPDATE STATUS
-app.post('/update-status', (req, res) => {
-  const { trackingNumber, status, location } = req.body;
+const updateShipmentStatus = (req, res) => {
+  const trackingNumber = req.params.trackingNumber || req.body.trackingNumber;
+  const { status, location, timestamp, date, message, description } = req.body;
   const data = readData();
+
+  if (!trackingNumber || !status) {
+    return res.status(400).json({ message: "trackingNumber and status are required" });
+  }
 
   const shipment = data.find(s => s.trackingNumber === trackingNumber);
 
   if (!shipment) {
-    return res.json({ message: "Not found" });
+    return res.status(404).json({ message: "Shipment not found" });
+  }
+
+  const eventTimestamp = timestamp || date || new Date().toISOString();
+  const event = {
+    status,
+    location: location || shipment.location,
+    timestamp: eventTimestamp
+  };
+
+  if (message || description) {
+    event.message = message || description;
   }
 
   shipment.status = status;
-  shipment.location = location;
-  shipment.date = new Date().toLocaleString();
+  shipment.location = event.location;
+  shipment.date = eventTimestamp;
+  shipment.trackingHistory = getTrackingHistory(shipment);
+  shipment.trackingHistory.push(event);
+  shipment.trackingHistory.sort((first, second) => getEventDate(first) - getEventDate(second));
 
   writeData(data);
 
-  res.json({ message: "Updated successfully" });
-});
+  res.json({ message: "Shipment status updated successfully", shipment });
+};
+
+app.post('/update-status', updateShipmentStatus);
+app.put('/update-status/:trackingNumber', updateShipmentStatus);
+app.patch('/shipments/:trackingNumber', updateShipmentStatus);
+app.put('/shipments/:trackingNumber/status', updateShipmentStatus);
 
 // TRACK
 app.get('/track/:trackingNumber', (req, res) => {
@@ -125,7 +171,10 @@ app.get('/track/:trackingNumber', (req, res) => {
     return res.status(404).json({ message: "Not found" });
   }
 
-  res.json(shipment);
+  res.json({
+    ...shipment,
+    trackingHistory: getTrackingHistory(shipment)
+  });
 });
 
 // HOME
