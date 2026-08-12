@@ -5,7 +5,23 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 
 const app = express();
-app.use(cors());
+const FRONTEND_ORIGIN = 'https://easywaycourierservice.pages.dev';
+const corsOptions = {
+  origin(origin, callback) {
+    // Requests without an Origin header (for example Render health checks) are
+    // not cross-origin browser requests, so do not emit CORS headers for them.
+    if (!origin || origin === FRONTEND_ORIGIN) {
+      return callback(null, origin === FRONTEND_ORIGIN ? FRONTEND_ORIGIN : false);
+    }
+    return callback(null, false);
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -33,7 +49,15 @@ const writeUsers = (data) => fs.writeFileSync(USERS_FILE, JSON.stringify(data, n
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-const AUTH_SECRET = crypto.createHash('sha256').update(`${ADMIN_EMAIL || ''}:${ADMIN_PASSWORD || ''}`).digest();
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+  throw new Error('ADMIN_EMAIL and ADMIN_PASSWORD must be configured before the server starts.');
+}
+// A separately configured secret is preferred. The fallback keeps existing
+// deployments working while never storing credentials in source code.
+const AUTH_SECRET = process.env.AUTH_SECRET || crypto
+  .createHash('sha256')
+  .update(`${ADMIN_EMAIL || ''}:${ADMIN_PASSWORD || ''}`)
+  .digest('hex');
 
 const base64urlEncode = (value) =>
   Buffer.from(value)
@@ -47,6 +71,8 @@ const base64urlDecode = (value) =>
 
 const hashPassword = (password) => bcrypt.hashSync(password, 10);
 const verifyPassword = (password, hash) => bcrypt.compareSync(password, hash);
+const isValidEmail = (email) =>
+  typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 const generateTracking = () =>
   'TRK' + Math.floor(100000 + Math.random() * 900000);
@@ -97,7 +123,11 @@ const verifyToken = (token) => {
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 
-  if (signature !== expectedSignature) {
+  const signaturesMatch =
+    signature.length === expectedSignature.length &&
+    crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+
+  if (!signaturesMatch) {
     return null;
   }
 
@@ -147,19 +177,57 @@ const ensureAdminAccount = () => {
   }
 
   users.push({
+    id: crypto.randomUUID(),
     email: ADMIN_EMAIL,
     role: 'admin',
     passwordHash: hashPassword(ADMIN_PASSWORD),
     createdAt: new Date().toISOString()
   });
   writeUsers(users);
-  console.log(`Created initial admin user: ${ADMIN_EMAIL}`);
+  console.log('Created initial admin user.');
 };
 
 ensureAdminAccount();
 
-// SIGNUP
-app.post('/signup', (req, res) => {
+// ADMIN REGISTER: only authenticated administrators can create administrators.
+app.post('/admin/register', requireAuth, requireAdmin, (req, res) => {
+  const { email, password } = req.body;
+  const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+  if (!isValidEmail(normalizedEmail)) {
+    return res.status(400).json({ message: 'A valid email is required' });
+  }
+
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters' });
+  }
+
+  const users = readUsers();
+  if (users.some(user => (user.email || '').toLowerCase() === normalizedEmail)) {
+    return res.status(409).json({ message: 'User already exists' });
+  }
+
+  const newAdmin = {
+    id: crypto.randomUUID(),
+    email: normalizedEmail,
+    role: 'admin',
+    passwordHash: hashPassword(password),
+    createdAt: new Date().toISOString()
+  };
+
+  users.push(newAdmin);
+  writeUsers(users);
+
+  return res.status(201).json({
+    user: {
+      email: newAdmin.email,
+      role: newAdmin.role
+    }
+  });
+});
+
+// REGISTER
+app.post('/register', (req, res) => {
   const users = readUsers();
   const { username, email, password } = req.body;
   const accountEmail = email || username;
@@ -256,12 +324,8 @@ app.post('/create-shipment', (req, res) => {
 });
 
 // GET ALL (ADMIN)
-app.get('/shipments', requireAuth, requireAdmin, (req, res) => {
+app.get('/admin/shipments', requireAuth, requireAdmin, (req, res) => {
   res.json(readData());
-});
-
-app.get('/admin', requireAuth, requireAdmin, (req, res) => {
-  res.json({ message: 'Admin dashboard access granted', user: req.user });
 });
 
 // UPDATE STATUS
@@ -303,10 +367,7 @@ const updateShipmentStatus = (req, res) => {
   res.json({ message: "Shipment status updated successfully", shipment });
 };
 
-app.post('/update-status', updateShipmentStatus);
-app.put('/update-status/:trackingNumber', updateShipmentStatus);
-app.patch('/shipments/:trackingNumber', updateShipmentStatus);
-app.put('/shipments/:trackingNumber/status', updateShipmentStatus);
+app.post('/admin/update-shipment/:trackingNumber', requireAuth, requireAdmin, updateShipmentStatus);
 
 // TRACK
 app.get('/track/:trackingNumber', (req, res) => {
