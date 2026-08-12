@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 app.use(cors());
@@ -29,6 +31,23 @@ const writeData = (data) => fs.writeFileSync(DATA_FILE, JSON.stringify(data, nul
 const readUsers = () => JSON.parse(fs.readFileSync(USERS_FILE));
 const writeUsers = (data) => fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
 
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const AUTH_SECRET = crypto.createHash('sha256').update(`${ADMIN_EMAIL || ''}:${ADMIN_PASSWORD || ''}`).digest();
+
+const base64urlEncode = (value) =>
+  Buffer.from(value)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+const base64urlDecode = (value) =>
+  Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+
+const hashPassword = (password) => bcrypt.hashSync(password, 10);
+const verifyPassword = (password, hash) => bcrypt.compareSync(password, hash);
+
 const generateTracking = () =>
   'TRK' + Math.floor(100000 + Math.random() * 900000);
 
@@ -49,37 +68,161 @@ const getTrackingHistory = (shipment) => {
 
 // ================= USER SYSTEM =================
 
+const generateToken = (user) => {
+  const payload = JSON.stringify({
+    email: user.email || user.username,
+    role: user.role || 'user',
+    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24
+  });
+  const signature = crypto
+    .createHmac('sha256', AUTH_SECRET)
+    .update(payload)
+    .digest('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return `${base64urlEncode(payload)}.${signature}`;
+};
+
+const verifyToken = (token) => {
+  if (!token || !token.includes('.')) return null;
+
+  const [payloadPart, signature] = token.split('.');
+  const payload = base64urlDecode(payloadPart);
+  const expectedSignature = crypto
+    .createHmac('sha256', AUTH_SECRET)
+    .update(payload)
+    .digest('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  if (signature !== expectedSignature) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(payload);
+    if (parsed.exp && parsed.exp < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const requireAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Authorization header missing or invalid' });
+  }
+
+  const token = authHeader.slice(7);
+  const user = verifyToken(token);
+
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+
+  req.user = user;
+  next();
+};
+
+const requireAdmin = (req, res, next) => {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+  next();
+};
+
+const ensureAdminAccount = () => {
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    return;
+  }
+
+  const users = readUsers();
+  if (users.find(u => u.email === ADMIN_EMAIL)) {
+    return;
+  }
+
+  users.push({
+    email: ADMIN_EMAIL,
+    role: 'admin',
+    passwordHash: hashPassword(ADMIN_PASSWORD),
+    createdAt: new Date().toISOString()
+  });
+  writeUsers(users);
+  console.log(`Created initial admin user: ${ADMIN_EMAIL}`);
+};
+
+ensureAdminAccount();
+
 // SIGNUP
 app.post('/signup', (req, res) => {
   const users = readUsers();
-  const { username, password } = req.body;
+  const { username, email, password } = req.body;
+  const accountEmail = email || username;
 
-  if (!username || !password) {
-    return res.json({ message: "Fill all fields" });
+  if (!accountEmail || !password) {
+    return res.status(400).json({ message: 'Fill all fields' });
   }
 
-  if (users.find(u => u.username === username)) {
-    return res.json({ message: "User already exists" });
+  if (users.find(u => u.email === accountEmail || u.username === accountEmail)) {
+    return res.status(400).json({ message: 'User already exists' });
   }
 
-  users.push({ username, password });
+  const newUser = {
+    email: accountEmail,
+    role: 'user',
+    passwordHash: hashPassword(password),
+    createdAt: new Date().toISOString()
+  };
+
+  if (username) {
+    newUser.username = username;
+  }
+
+  users.push(newUser);
   writeUsers(users);
 
-  res.json({ message: "Account created successfully" });
+  res.json({ message: 'Account created successfully' });
 });
 
 // LOGIN
 app.post('/login', (req, res) => {
   const users = readUsers();
-  const { username, password } = req.body;
+  const { email, username, password } = req.body;
+  const loginId = email || username;
 
-  const user = users.find(u => u.username === username && u.password === password);
-
-  if (!user) {
-    return res.json({ message: "Invalid login" });
+  if (!loginId || !password) {
+    return res.status(400).json({ message: 'Email and password are required' });
   }
 
-  res.json({ message: "Login successful" });
+  const user = users.find(
+    u => u.email === loginId || u.username === loginId
+  );
+
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid login' });
+  }
+
+  const isValid = user.passwordHash
+    ? verifyPassword(password, user.passwordHash)
+    : user.password === password;
+
+  if (!isValid) {
+    return res.status(401).json({ message: 'Invalid login' });
+  }
+
+  const token = generateToken(user);
+  res.json({
+    token,
+    user: {
+      email: user.email || user.username,
+      role: user.role || 'user'
+    }
+  });
 });
 
 // ================= SHIPMENT =================
@@ -113,8 +256,12 @@ app.post('/create-shipment', (req, res) => {
 });
 
 // GET ALL (ADMIN)
-app.get('/shipments', (req, res) => {
+app.get('/shipments', requireAuth, requireAdmin, (req, res) => {
   res.json(readData());
+});
+
+app.get('/admin', requireAuth, requireAdmin, (req, res) => {
+  res.json({ message: 'Admin dashboard access granted', user: req.user });
 });
 
 // UPDATE STATUS
