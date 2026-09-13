@@ -1,0 +1,10 @@
+[
+  {
+    "id": "13667e1b-ca5d-43c4-9a58-fa50b1fb51aa",
+    "email": "admin@easyway.local",
+    "password": "scrypt:15c7dfd82fe77df3a78b8e4f928b00fd:eac9da3764b8e8fc2607a612aea33c006a3116e7c80a157ee3e272d48cec6db3022055ef6fa8d8d2657e04ebbf7189a2b429a8efa32a5d3c0b030bdf2c66aa18",
+    "role": "admin",
+    "token": "55b5ef1dd039440420a443e640db4334",
+    "createdAt": "2026-08-13T12:56:26.146Z"
+  }
+]
