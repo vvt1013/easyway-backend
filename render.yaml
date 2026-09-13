@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: easyway-backend
+    runtime: node
+    buildCommand: npm ci
+    startCommand: npm start
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: easyway-data
+      mountPath: /var/data
+      sizeGB: 1
